@@ -1,0 +1,379 @@
+import React, { useState, useEffect } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, collection, addDoc, getDocs, updateDoc, doc, onSnapshot, query, serverTimestamp } from 'firebase/firestore';
+
+function App() {
+  // State untuk menyimpan instance Firebase
+  const [db, setDb] = useState(null);
+  const [auth, setAuth] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
+
+  // State untuk data produk
+  const [products, setProducts] = useState([]);
+  const [newProductName, setNewProductName] = useState('');
+  const [stockChangeProductId, setStockChangeProductId] = useState('');
+  const [stockChangeQuantity, setStockChangeQuantity] = useState(0);
+  const [stockChangeType, setStockChangeType] = useState('in'); // 'in' or 'out'
+
+  // State untuk pesan notifikasi
+  const [message, setMessage] = useState('');
+  const [messageType, setMessageType] = useState(''); // 'success' or 'error'
+
+  // Fungsi untuk menampilkan notifikasi
+  const showMessage = (msg, type) => {
+    setMessage(msg);
+    setMessageType(type);
+    setTimeout(() => {
+      setMessage('');
+      setMessageType('');
+    }, 3000); // Pesan akan hilang setelah 3 detik
+  };
+
+  // Inisialisasi Firebase dan autentikasi
+  useEffect(() => {
+    try {
+      // Mengambil __app_id dan __firebase_config dari lingkungan Canvas
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+
+      if (Object.keys(firebaseConfig).length === 0) {
+        console.error("Firebase config is missing. Please ensure '__firebase_config' is provided.");
+        showMessage('Error: Konfigurasi Firebase hilang.', 'error');
+        return;
+      }
+
+      const app = initializeApp(firebaseConfig);
+      const firestore = getFirestore(app);
+      const authentication = getAuth(app);
+
+      setDb(firestore);
+      setAuth(authentication);
+
+      // Mengautentikasi pengguna
+      const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+      if (initialAuthToken) {
+        signInWithCustomToken(authentication, initialAuthToken)
+          .then(() => {
+            console.log("Signed in with custom token");
+          })
+          .catch((error) => {
+            console.error("Error signing in with custom token:", error);
+            signInAnonymously(authentication)
+              .then(() => console.log("Signed in anonymously due to custom token error."))
+              .catch((anonError) => console.error("Error signing in anonymously:", anonError));
+          });
+      } else {
+        signInAnonymously(authentication)
+          .then(() => console.log("Signed in anonymously."))
+          .catch((error) => console.error("Error signing in anonymously:", error));
+      }
+
+      // Listener untuk perubahan status autentikasi
+      const unsubscribe = onAuthStateChanged(authentication, (user) => {
+        if (user) {
+          setUserId(user.uid);
+          setIsAuthReady(true);
+        } else {
+          // Jika tidak ada user, buat UID acak (untuk non-persistent anonymous)
+          setUserId(crypto.randomUUID());
+          setIsAuthReady(true);
+        }
+      });
+
+      return () => unsubscribe(); // Cleanup listener saat komponen di-unmount
+    } catch (error) {
+      console.error("Failed to initialize Firebase:", error);
+      showMessage('Error: Gagal menginisialisasi Firebase.', 'error');
+    }
+  }, []);
+
+  // Mengambil dan mendengarkan perubahan data produk
+  useEffect(() => {
+    if (db && userId && isAuthReady) {
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      const productsCollectionRef = collection(db, `artifacts/${appId}/users/${userId}/products`);
+      const q = query(productsCollectionRef);
+
+      const unsubscribe = onSnapshot(q, (snapshot) => {
+        const productsList = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+        setProducts(productsList);
+      }, (error) => {
+        console.error("Error fetching products:", error);
+        showMessage('Error: Gagal mengambil data produk.', 'error');
+      });
+
+      return () => unsubscribe(); // Cleanup listener saat komponen di-unmount atau userId berubah
+    }
+  }, [db, userId, isAuthReady]);
+
+  // Fungsi untuk menambahkan produk baru
+  const handleAddProduct = async (e) => {
+    e.preventDefault();
+    if (!newProductName.trim()) {
+      showMessage('Nama produk tidak boleh kosong.', 'error');
+      return;
+    }
+    if (!db || !userId) {
+      showMessage('Database tidak siap atau ID pengguna tidak tersedia.', 'error');
+      return;
+    }
+
+    try {
+      const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+      await addDoc(collection(db, `artifacts/${appId}/users/${userId}/products`), {
+        name: newProductName.trim(),
+        stock: 0,
+        createdAt: serverTimestamp(),
+        lastUpdatedAt: serverTimestamp()
+      });
+      setNewProductName('');
+      showMessage('Produk berhasil ditambahkan!', 'success');
+    } catch (e) {
+      console.error("Error adding document: ", e);
+      showMessage('Error: Gagal menambahkan produk.', 'error');
+    }
+  };
+
+  // Fungsi untuk mengubah stok (masuk/keluar)
+  const handleStockChange = async (e) => {
+    e.preventDefault();
+    if (!stockChangeProductId || stockChangeQuantity <= 0) {
+      showMessage('Pilih produk dan masukkan kuantitas positif.', 'error');
+      return;
+    }
+    if (!db || !userId) {
+      showMessage('Database tidak siap atau ID pengguna tidak tersedia.', 'error');
+      return;
+    }
+
+    try {
+      const productRef = doc(db, `artifacts/${typeof __app_id !== 'undefined' ? __app_id : 'default-app-id'}/users/${userId}/products`, stockChangeProductId);
+      const product = products.find(p => p.id === stockChangeProductId);
+
+      if (!product) {
+        showMessage('Produk tidak ditemukan.', 'error');
+        return;
+      }
+
+      let newStock = product.stock;
+      if (stockChangeType === 'in') {
+        newStock += parseInt(stockChangeQuantity);
+      } else { // stockChangeType === 'out'
+        if (newStock < parseInt(stockChangeQuantity)) {
+          showMessage('Stok tidak mencukupi untuk pengurangan ini.', 'error');
+          return;
+        }
+        newStock -= parseInt(stockChangeQuantity);
+      }
+
+      await updateDoc(productRef, {
+        stock: newStock,
+        lastUpdatedAt: serverTimestamp()
+      });
+      setStockChangeProductId('');
+      setStockChangeQuantity(0);
+      showMessage('Stok berhasil diperbarui!', 'success');
+    } catch (e) {
+      console.error("Error updating document: ", e);
+      showMessage('Error: Gagal memperbarui stok.', 'error');
+    }
+  };
+
+  // Fungsi untuk mengunduh laporan CSV
+  const handleDownloadReport = () => {
+    if (products.length === 0) {
+      showMessage('Tidak ada data produk untuk diunduh.', 'error');
+      return;
+    }
+
+    const headers = ["Nama Produk", "Stok", "Terakhir Diperbarui"];
+    const csvRows = [];
+
+    // Add headers to CSV rows
+    csvRows.push(headers.join(','));
+
+    // Add product data to CSV rows
+    products.forEach(product => {
+      const lastUpdated = product.lastUpdatedAt ? new Date(product.lastUpdatedAt.toDate()).toLocaleString() : 'N/A';
+      csvRows.push(`${product.name},${product.stock},"${lastUpdated}"`);
+    });
+
+    const csvString = csvRows.join('\n');
+    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `laporan_stok_salon_${new Date().toISOString().slice(0, 10)}.csv`; // Filename with current date
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    showMessage('Laporan berhasil diunduh!', 'success');
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-pink-100 to-purple-100 p-4 font-sans text-gray-800 flex flex-col items-center">
+      <div className="w-full max-w-4xl bg-white shadow-xl rounded-xl p-6 md:p-8">
+        <h1 className="text-3xl md:text-4xl font-extrabold text-center text-purple-700 mb-6">
+          Aplikasi Stok Salon
+        </h1>
+
+        {userId && (
+          <p className="text-sm text-center text-gray-500 mb-4">
+            ID Pengguna Anda: <span className="font-mono bg-gray-100 px-2 py-1 rounded-md break-all">{userId}</span>
+          </p>
+        )}
+
+        {/* Notifikasi */}
+        {message && (
+          <div className={`p-3 mb-4 rounded-lg text-white text-center ${messageType === 'success' ? 'bg-green-500' : 'bg-red-500'}`}>
+            {message}
+          </div>
+        )}
+
+        {/* Tambah Produk Baru */}
+        <div className="mb-8 p-6 bg-purple-50 rounded-lg shadow-inner">
+          <h2 className="text-2xl font-bold text-purple-600 mb-4">Tambah Produk Baru</h2>
+          <form onSubmit={handleAddProduct} className="flex flex-col md:flex-row gap-4">
+            <input
+              type="text"
+              placeholder="Nama Produk"
+              value={newProductName}
+              onChange={(e) => setNewProductName(e.target.value)}
+              className="flex-grow p-3 border border-purple-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-purple-400"
+              required
+            />
+            <button
+              type="submit"
+              className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-3 px-6 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+            >
+              Tambah Produk
+            </button>
+          </form>
+        </div>
+
+        {/* Perbarui Stok */}
+        <div className="mb-8 p-6 bg-pink-50 rounded-lg shadow-inner">
+          <h2 className="text-2xl font-bold text-pink-600 mb-4">Perbarui Stok</h2>
+          <form onSubmit={handleStockChange} className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
+            <div className="flex flex-col">
+              <label htmlFor="productSelect" className="text-sm font-medium text-gray-700 mb-1">Pilih Produk:</label>
+              <select
+                id="productSelect"
+                value={stockChangeProductId}
+                onChange={(e) => setStockChangeProductId(e.target.value)}
+                className="p-3 border border-pink-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-400"
+                required
+              >
+                <option value="">-- Pilih Produk --</option>
+                {products.map(product => (
+                  <option key={product.id} value={product.id}>
+                    {product.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="flex flex-col">
+              <label htmlFor="quantityInput" className="text-sm font-medium text-gray-700 mb-1">Kuantitas:</label>
+              <input
+                id="quantityInput"
+                type="number"
+                placeholder="Kuantitas"
+                value={stockChangeQuantity}
+                onChange={(e) => setStockChangeQuantity(Math.max(0, parseInt(e.target.value) || 0))}
+                min="0"
+                className="p-3 border border-pink-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-pink-400"
+                required
+              />
+            </div>
+
+            <div className="flex flex-col">
+              <label htmlFor="changeType" className="text-sm font-medium text-gray-700 mb-1">Jenis Perubahan:</label>
+              <div className="flex gap-2">
+                <label className="inline-flex items-center">
+                  <input
+                    type="radio"
+                    name="stockType"
+                    value="in"
+                    checked={stockChangeType === 'in'}
+                    onChange={() => setStockChangeType('in')}
+                    className="form-radio text-pink-600"
+                  />
+                  <span className="ml-2 text-gray-700">Masuk</span>
+                </label>
+                <label className="inline-flex items-center">
+                  <input
+                    type="radio"
+                    name="stockType"
+                    value="out"
+                    checked={stockChangeType === 'out'}
+                    onChange={() => setStockChangeType('out')}
+                    className="form-radio text-pink-600"
+                  />
+                  <span className="ml-2 text-gray-700">Keluar</span>
+                </label>
+              </div>
+            </div>
+
+            <div className="md:col-span-3 flex justify-center">
+                <button
+                type="submit"
+                className="bg-pink-600 hover:bg-pink-700 text-white font-bold py-3 px-8 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+                >
+                Perbarui Stok
+                </button>
+            </div>
+          </form>
+        </div>
+
+        {/* Daftar Produk */}
+        <div className="p-6 bg-white rounded-lg shadow-inner">
+          <h2 className="text-2xl font-bold text-gray-700 mb-4">Daftar Produk</h2>
+          {products.length === 0 ? (
+            <p className="text-center text-gray-500">Belum ada produk. Tambahkan produk di atas!</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-full bg-white rounded-lg overflow-hidden">
+                <thead className="bg-gradient-to-r from-purple-100 to-pink-100">
+                  <tr>
+                    <th className="py-3 px-4 text-left text-sm font-bold text-purple-800 uppercase tracking-wider rounded-tl-lg">Nama Produk</th>
+                    <th className="py-3 px-4 text-left text-sm font-bold text-purple-800 uppercase tracking-wider">Stok</th>
+                    <th className="py-3 px-4 text-left text-sm font-bold text-purple-800 uppercase tracking-wider rounded-tr-lg">Terakhir Diperbarui</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {products.map(product => (
+                    <tr key={product.id} className="border-b border-gray-200 last:border-b-0 hover:bg-gray-50">
+                      <td className="py-3 px-4 text-gray-900 font-medium">{product.name}</td>
+                      <td className="py-3 px-4 text-gray-700">{product.stock}</td>
+                      <td className="py-3 px-4 text-gray-600 text-sm">
+                        {product.lastUpdatedAt ? new Date(product.lastUpdatedAt.toDate()).toLocaleString() : 'N/A'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Tombol Download Laporan */}
+          <div className="mt-6 text-center">
+            <button
+              onClick={handleDownloadReport}
+              className="bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-8 rounded-lg shadow-md transition duration-300 ease-in-out transform hover:scale-105"
+            >
+              Download Laporan CSV
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default App;
